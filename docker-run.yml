@@ -1,0 +1,84 @@
+name: Update Running Service
+on:
+  workflow_call:
+    inputs:
+      IMAGE_NAME:
+        description: "The image name and tag for the service being deployed"
+        required: true
+        type: string
+      SERVICE_NAME:
+        description: "The name of the service as defined in the Docker Compose manifest file (docker-compose.yaml)"
+        required: true
+        type: string
+      REGISTRY_URL:
+        description: "The URL to the container registry being used (i.e. docker.io for Docker Hub or ghcr.io for GitHub Container Registry)"
+        required: true
+        type: string
+      REGISTRY_USERNAME:
+        description: "The username of the owner of the container on the container registry"
+        required: true
+        type: string
+    secrets:
+      SSH_HOST:
+        description: "The IP address or URL to the SSH host"
+        required: true
+      SSH_USERNAME:
+        description: "The username of the user on the PTI server"
+        required: true
+      SSH_PASSWORD:
+        description: "The password for the user on the PTI server"
+        required: true
+      REGISTRY_PAT:
+        description: "The personal access token (PAT) used to access the container registry"
+        required: true
+      B64_OVPN_CONFIG:
+        description: "The base-64 encoded and non-line wrapped OpenVPN configuration"
+        required: true
+
+jobs:
+  build:
+    name: Build and Run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OpenVPN client
+        run: sudo apt-get update && sudo apt-get install openvpn -y
+
+      - name: Create OpenVPN configuration file
+        env:
+          OVPN_CONFIG: ${{ secrets.B64_OVPN_CONFIG }}
+        run: echo "$OVPN_CONFIG" | base64 -d > $RUNNER_TEMP/client.ovpn
+
+      - name: Connect to OpenVPN server
+        run: |
+          sudo openvpn --config $RUNNER_TEMP/client.ovpn --daemon ovpn
+          sleep 5
+
+          for i in {1..10}; do
+            if ping -c 1 ${{ secrets.SSH_HOST }}; then
+              echo "VPN is up and Server is reachable!"
+              exit 0
+            fi
+            echo "Waiting for VPN connection..."
+            sleep 3
+          done
+          echo "VPN connection timed out"
+          exit 1
+
+      - name: Update services on PTI server
+        uses: appleboy/ssh-action@v1.2.4
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          script: |
+            echo 'Connected to server PTI!'
+            cd ~
+            echo "${{ secrets.SSH_PASSWORD }}" | sudo -S docker ps
+            echo "${{ secrets.REGISTRY_PAT }}" | sudo docker login "${{ inputs.REGISTRY_URL }}" -u "${{ inputs.REGISTRY_USERNAME }}" --password-stdin
+            echo "${{ secrets.SSH_PASSWORD }}" | sudo -S docker pull "${{ inputs.IMAGE_NAME }}"
+            echo "${{ secrets.SSH_PASSWORD }}" | sudo -S docker compose up -d "${{ inputs.SERVICE_NAME }}"
+            echo "${{ secrets.SSH_PASSWORD }}" | sudo -S docker ps
+
+      - name: Disconnect VPN
+        if: always()
+        run: sudo killall openvpn || true
